@@ -1,0 +1,100 @@
+from scipy.io import wavfile
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load audio data
+import os
+
+# Read any .wav file inside the "input_data" folder
+wav_files = [f for f in os.listdir("input_data") if f.endswith('.wav')]
+if not wav_files:
+    raise FileNotFoundError("No .wav files found in the 'input_data' folder")
+
+# Use the first .wav file found
+wav_file_path = os.path.join("input_data", wav_files[0])
+sample_rate, audio_data = wavfile.read(wav_file_path)
+
+# Convert to mono if it's stereo
+if len(audio_data.shape) == 2:
+    audio_data_mono = np.mean(audio_data, axis=1).astype(np.int16)
+else:
+    audio_data_mono = audio_data
+
+# Length of the audio in seconds
+audio_length_seconds = len(audio_data_mono) / sample_rate
+
+# Create an array of time windows for calculating BPM
+time_windows = np.arange(0, audio_length_seconds - 5, 1)
+
+# Initialize an array to store "smart" detected peaks
+smart_peaks = []
+
+# Initialize a variable to store the current BPM
+current_bpm = None
+
+# Initialize a variable to store the time of the last detected peak
+last_peak_time = None
+
+# Initialize cooldown
+cooldown = 0 
+
+# Loop through the audio data to perform smart peak detection
+for i in range(len(audio_data_mono) - 1):
+    if cooldown > 0: cooldown -= 1
+    current_amplitude = audio_data_mono[i]
+    if last_peak_time is None or ((i / sample_rate) - last_peak_time > 0.5):
+        last_peak_time = None
+    if cooldown == 0 and current_amplitude > 5000: # Lower this number to make more sensitive
+        if last_peak_time is None or ((i / sample_rate) - last_peak_time >= 0.1):
+            smart_peaks.append(i)
+            last_peak_time = i / sample_rate
+            if len(smart_peaks) >= 2:
+                time_between_peaks = (smart_peaks[-1] - smart_peaks[-2]) / sample_rate
+                current_bpm = 60 / time_between_peaks
+                cooldown = int(sample_rate * (60 / current_bpm) * 0.6)  # xx% of the time between each beat
+
+# Convert to a NumPy array for easier manipulation
+smart_peaks = np.array(smart_peaks)
+smart_peaks = np.unique(smart_peaks)
+
+# Calculate time instances for these smartly detected peaks
+smart_peak_times = smart_peaks / sample_rate
+
+# Initialize array to store smart BPM values
+smart_bpm_values = []
+
+# Calculate BPM for each time window using smart peaks
+for start_time in time_windows:
+    end_time = start_time + 5
+    peaks_in_window = smart_peak_times[(smart_peak_times >= start_time) & (smart_peak_times < end_time)]
+    if len(peaks_in_window) >= 2:
+        avg_bpm = (60 * len(peaks_in_window) / (peaks_in_window[-1] - peaks_in_window[0])) / 2
+        smart_bpm_values.append(avg_bpm)
+    else:
+        smart_bpm_values.append(np.nan)
+
+# Plot smart BPM over time
+plt.figure(figsize=(15, 6))
+plt.plot(time_windows, smart_bpm_values, marker='o', linestyle='-')
+plt.xlabel('Time (s)')
+plt.ylabel('BPM')
+plt.title('BPM Over Time')
+plt.grid(True)
+plt.show()
+
+# Visualization
+segment_start = 27  # Start time in seconds
+segment_end = 30  # End time in seconds
+segment_start_sample = int(segment_start * sample_rate)
+segment_end_sample = int(segment_end * sample_rate)
+
+# Plot the audio data and detected peaks for the given segment
+plt.figure(figsize=(15, 6))
+plt.plot(np.arange(segment_start_sample, segment_end_sample) / sample_rate, audio_data_mono[segment_start_sample:segment_end_sample], label="Waveform")
+plt.scatter(smart_peaks[(smart_peaks >= segment_start_sample) & (smart_peaks < segment_end_sample)] / sample_rate, audio_data_mono[smart_peaks[(smart_peaks >= segment_start_sample) & (smart_peaks < segment_end_sample)]], color="red", label="Peaks")
+plt.xlabel("Time (s)")
+plt.ylabel("Amplitude")
+plt.title("Detected Peaks in Segment")
+plt.legend()
+plt.grid(True)
+plt.show()
