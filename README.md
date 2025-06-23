@@ -19,10 +19,9 @@ Before running the script, ensure you have the following installed:
 ## Installation
 1. **Clone the repository (or download the script):**
     ```
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
+    git clone https://github.com/projectWXP/Heartbeat-BPM-analysis
+    cd Heartbeat-BPM-analysis
     ```
-    (Replace `your-username` and `your-repo-name` with your actual GitHub details.)
 2. **Install the required Python libraries:**
     ```
     pip install numpy pandas scipy plotly pydub scikit-learn tkinter ttkbootstrap
