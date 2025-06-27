@@ -35,11 +35,30 @@ except ImportError:
     logging.warning("FFmpeg is also required for audio conversion (add to system PATH).")
     AudioSegment = None
 
+# --- Optional Export Libraries ---
+try:
+    import openpyxl
+except ImportError:
+    logging.warning("openpyxl not found ('pip install openpyxl'). XLSX export will be unavailable.")
+    openpyxl = None
+try:
+    import odf
+    from odf import opendocument, text, table
+except ImportError:
+    logging.warning("odfpy not found ('pip install odfpy'). ODS export will be unavailable.")
+    odf = None
+try:
+    from fpdf import FPDF
+except ImportError:
+    logging.warning("fpdf2 not found ('pip install fpdf2'). PDF export will be unavailable.")
+    FPDF = None
+
+
 # --- Centralized Configuration for Easy Tuning (don't remove the comments)---
 DEFAULT_PARAMS = {
     # Preprocessing Parameters
-    "downsample_factor": 300,     # The factor by which to reduce the audio's sample rate. higher = less detail, faster processing, lower file size
-    "bandpass_freqs": (20, 150),  # (low_hz, high_hz)
+    "downsample_factor": 300,      # The factor by which to reduce the audio's sample rate. higher = less detail, faster processing, lower file size
+    "bandpass_freqs": (20, 150),   # (low_hz, high_hz)
     # =================================================================================
     # Core Beat Detection Parameters
     # These settings govern the main algorithm for finding and classifying peaks.
@@ -139,7 +158,7 @@ DEFAULT_PARAMS = {
 
     "output_smoothing_window_sec": 5,
     "save_filtered_wav": True,
-    "hrv_window_size_beats": 40,  # The size of the sliding window in number of beats.
+    "hrv_window_size_beats": 40,   # The size of the sliding window in number of beats.
     "hrv_step_size_beats": 5      # How many beats the HRV window moves in each step.
 }
 
@@ -1420,10 +1439,11 @@ def analyze_wav_file(wav_file_path, params, start_bpm_hint): # We keep the signa
     final_peaks = correct_peaks_by_rhythm(peaks, audio_envelope, sample_rate, params)
 
     # --- FINAL CALCULATIONS AND OUTPUT ---
+    analysis_output = { "file_name": wav_file_path }
     if len(final_peaks) < 2:
         logging.warning("Not enough S1 peaks detected after correction to calculate BPM.")
         plot_results(audio_envelope, final_peaks, all_raw_peaks, analysis_data, pd.Series(dtype=np.float64), np.array([]), sample_rate, wav_file_path, params)
-        return
+        return analysis_output # Return partial results
 
     smoothed_bpm, bpm_times = calculate_bpm_series(final_peaks, sample_rate, params)
 
@@ -1467,15 +1487,30 @@ def analyze_wav_file(wav_file_path, params, start_bpm_hint): # We keep the signa
     output_log_path = f"{file_name_no_ext}_Debug_Log.md"
     create_chronological_log_file(audio_envelope, sample_rate, all_raw_peaks, analysis_data, smoothed_bpm, output_log_path, wav_file_path)
 
+    # --- Bundle all results for return ---
+    analysis_output.update({
+        "hrv_summary": hrv_summary_stats,
+        "hrr_stats": hrr_stats,
+        "peak_exertion_stats": peak_exertion_stats,
+        "peak_recovery_stats": peak_recovery_stats,
+        "major_inclines": major_inclines,
+        "major_declines": major_declines,
+        "smoothed_bpm": smoothed_bpm,
+        "bpm_times": bpm_times,
+        "windowed_hrv_df": windowed_hrv_df
+    })
+    return analysis_output
+
 
 # --- GUI Class ---
 class BPMApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Heartbeat BPM Analyzer")
-        self.root.geometry("550x350")
+        self.root.geometry("600x380")
         self.style = ttkb.Style(theme='minty')
         self.current_file = None
+        self.analysis_results = None # To store results for export
         self.params = DEFAULT_PARAMS.copy()
         self.log_queue = queue.Queue()
         self.create_widgets()
@@ -1489,7 +1524,7 @@ class BPMApp:
         # File selection
         file_frame = ttk.LabelFrame(main_frame, text="Audio File", padding=10)
         file_frame.pack(fill=tk.X, pady=5)
-        self.file_label = ttk.Label(file_frame, text="No file selected", wraplength=450)
+        self.file_label = ttk.Label(file_frame, text="No file selected", wraplength=500)
         self.file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         browse_btn = ttk.Button(file_frame, text="Browse", command=self.select_file, bootstyle=INFO)
         browse_btn.pack(side=tk.RIGHT, padx=5)
@@ -1504,8 +1539,11 @@ class BPMApp:
         # Action Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=20)
+        self.export_btn = ttk.Button(btn_frame, text="Export Results", command=self.export_data, bootstyle=SECONDARY, state=tk.DISABLED)
+        self.export_btn.pack(side=tk.LEFT, padx=5)
         self.analyze_btn = ttk.Button(btn_frame, text="Analyze", command=self.start_analysis_thread, bootstyle=SUCCESS, state=tk.DISABLED)
         self.analyze_btn.pack(side=tk.RIGHT, padx=5)
+
 
         # Status Bar
         self.status_var = tk.StringVar(value="Select an audio file to begin.")
@@ -1522,12 +1560,14 @@ class BPMApp:
                 if message_type == "status":
                     self.status_var.set(data)
                 elif message_type == "analysis_complete":
-                    self.status_var.set("Analysis complete!")
+                    self.status_var.set("Analysis complete! Reports saved. Ready to export.")
                     self.analyze_btn.config(state=tk.NORMAL)
+                    self.export_btn.config(state=tk.NORMAL) # Enable export button
                 elif message_type == "error":
-                     self.status_var.set("An error occurred. Check logs.")
-                     self.analyze_btn.config(state=tk.NORMAL)
-                     messagebox.showerror("Analysis Error", data)
+                    self.status_var.set("An error occurred. Check logs.")
+                    self.analyze_btn.config(state=tk.NORMAL)
+                    self.export_btn.config(state=tk.DISABLED) # Keep it disabled on error
+                    messagebox.showerror("Analysis Error", data)
 
         finally:
             self.root.after(100, self.process_log_queue)
@@ -1539,6 +1579,7 @@ class BPMApp:
             self.current_file = filename
             self.file_label.config(text=os.path.basename(filename))
             self.analyze_btn.config(state=tk.NORMAL)
+            self.export_btn.config(state=tk.DISABLED) # Disable on new file selection
             self._update_status(f"Ready to analyze: {os.path.basename(filename)}")
 
     def _find_initial_audio_file(self):
@@ -1565,6 +1606,8 @@ class BPMApp:
             return
 
         self.analyze_btn.config(state=tk.DISABLED)
+        self.export_btn.config(state=tk.DISABLED)
+        self.analysis_results = None # Clear previous results
         self._update_status("Starting analysis...")
 
         analysis_thread = threading.Thread(target=self._run_analysis_in_background)
@@ -1591,13 +1634,165 @@ class BPMApp:
                 shutil.copy(self.current_file, wav_path)
 
             self.log_queue.put(("status", "Processing and analyzing heartbeat..."))
-            analyze_wav_file(wav_path, self.params, start_bpm_hint)
+            self.analysis_results = analyze_wav_file(wav_path, self.params, start_bpm_hint)
             self.log_queue.put(("analysis_complete", None))
 
         except Exception as e:
             error_info = f"An error occurred:\n{str(e)}"
             self.log_queue.put(("error", error_info))
             logging.error(f"Full analysis error: {traceback.format_exc()}")
+
+    def export_data(self):
+        """Handles the logic for exporting data to a selected file format."""
+        if not self.analysis_results:
+            messagebox.showinfo("Export Notice", "Please run an analysis before exporting.")
+            return
+
+        file_types_list = []
+        if openpyxl: file_types_list.append(('Excel Spreadsheet', '*.xlsx'))
+        if odf: file_types_list.append(('OpenDocument Spreadsheet', '*.ods'))
+        if FPDF: file_types_list.append(('PDF Document', '*.pdf'))
+        file_types_list.extend([
+            ('HTML File', '*.html'),
+            ('Comma-Separated Values', '*.csv'),
+            ('Tab-Separated Values', '*.tsv')
+        ])
+
+        file_name_base = os.path.splitext(os.path.basename(self.analysis_results.get("file_name", "analysis")))[0]
+
+        output_path = filedialog.asksaveasfilename(
+            title="Export Analysis Results",
+            initialfile=f"{file_name_base}_export",
+            filetypes=file_types_list,
+            defaultextension='.xlsx'
+        )
+
+        if not output_path:
+            return # User cancelled
+
+        self.status_var.set(f"Exporting to {os.path.basename(output_path)}...")
+        self.root.update_idletasks() # Force GUI update
+
+        try:
+            # Prepare dataframes
+            results = self.analysis_results
+            summary_df = self._prepare_summary_df(results)
+            bpm_df = self._prepare_bpm_df(results)
+            hrv_df = results.get('windowed_hrv_df', pd.DataFrame())
+            inclines_df = pd.DataFrame(results.get('major_inclines', []))
+            declines_df = pd.DataFrame(results.get('major_declines', []))
+
+            ext = os.path.splitext(output_path)[1].lower()
+            if ext == '.xlsx' or ext == '.ods':
+                engine = 'openpyxl' if ext == '.xlsx' else 'odf'
+                with pd.ExcelWriter(output_path, engine=engine) as writer:
+                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                    bpm_df.to_excel(writer, sheet_name='BPM_Over_Time', index=False)
+                    if not hrv_df.empty: hrv_df.to_excel(writer, sheet_name='HRV_Metrics', index=False)
+                    if not inclines_df.empty: inclines_df.to_excel(writer, sheet_name='Exertion_Periods', index=False)
+                    if not declines_df.empty: declines_df.to_excel(writer, sheet_name='Recovery_Periods', index=False)
+            elif ext == '.csv' or ext == '.tsv':
+                sep = ',' if ext == '.csv' else '\t'
+                with open(output_path, 'w', encoding='utf-8', newline='') as f:
+                    f.write("# Analysis Summary\n")
+                    f.write(summary_df.to_csv(sep=sep, index=False))
+                    f.write("\n# BPM Over Time\n")
+                    f.write(bpm_df.to_csv(sep=sep, index=False))
+                    if not hrv_df.empty:
+                        f.write("\n# HRV Metrics\n")
+                        f.write(hrv_df.to_csv(sep=sep, index=False))
+            elif ext == '.html':
+                 with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(f"<html><head><title>Analysis for {file_name_base}</title></head><body>")
+                    f.write(f"<h1>Analysis for {file_name_base}</h1>")
+                    f.write("<h2>Summary</h2>" + summary_df.to_html(index=False))
+                    f.write("<h2>BPM Over Time</h2>" + bpm_df.to_html(index=False))
+                    if not hrv_df.empty: f.write("<h2>HRV Metrics</h2>" + hrv_df.to_html(index=False))
+                    if not inclines_df.empty: f.write("<h2>Exertion Periods</h2>" + inclines_df.to_html(index=False))
+                    if not declines_df.empty: f.write("<h2>Recovery Periods</h2>" + declines_df.to_html(index=False))
+                    f.write("</body></html>")
+            elif ext == '.pdf':
+                self._export_to_pdf(output_path, file_name_base, summary_df, bpm_df, hrv_df, inclines_df, declines_df)
+
+            self.status_var.set(f"Successfully exported to {os.path.basename(output_path)}")
+            messagebox.showinfo("Export Successful", f"Data exported to:\n{output_path}")
+        except Exception as e:
+            logging.error(f"Failed to export data: {traceback.format_exc()}")
+            messagebox.showerror("Export Failed", f"Could not export data.\nError: {e}")
+            self.status_var.set("Export failed.")
+
+
+    def _prepare_summary_df(self, results):
+        """Helper to create a nice summary DataFrame from various result dicts."""
+        summary_data = []
+        # General HRV Summary
+        if 'hrv_summary' in results and results['hrv_summary']:
+            for k, v in results['hrv_summary'].items():
+                summary_data.append({'Metric': k, 'Value': f"{v:.2f}"})
+        # HRR Stats
+        if 'hrr_stats' in results and results['hrr_stats']:
+            hrr = results['hrr_stats']
+            summary_data.append({'Metric': '1-Min HRR (BPM Drop)', 'Value': f"{hrr['hrr_value_bpm']:.2f}"})
+            summary_data.append({'Metric': 'Peak BPM for HRR', 'Value': f"{hrr['peak_bpm']:.2f}"})
+        # Peak Exertion
+        if 'peak_exertion_stats' in results and results['peak_exertion_stats']:
+            pes = results['peak_exertion_stats']
+            summary_data.append({'Metric': 'Peak Exertion Rate (BPM/sec)', 'Value': f"{pes['slope_bpm_per_sec']:.2f}"})
+        # Peak Recovery
+        if 'peak_recovery_stats' in results and results['peak_recovery_stats']:
+            prs = results['peak_recovery_stats']
+            summary_data.append({'Metric': 'Peak Recovery Rate (BPM/sec)', 'Value': f"{prs['slope_bpm_per_sec']:.2f}"})
+        return pd.DataFrame(summary_data)
+
+    def _prepare_bpm_df(self, results):
+        """Helper to create the main BPM time series DataFrame."""
+        if 'smoothed_bpm' in results and not results['smoothed_bpm'].empty:
+            df = pd.DataFrame({
+                'Timestamp': results['smoothed_bpm'].index,
+                'Time_sec': results['bpm_times'],
+                'Smoothed_BPM': results['smoothed_bpm'].values
+            })
+            df['Timestamp'] = df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S.%f')
+            return df
+        return pd.DataFrame()
+
+    def _export_to_pdf(self, path, title, summary_df, bpm_df, hrv_df, inclines_df, declines_df):
+        """Helper to generate a PDF report."""
+        if not FPDF:
+            raise ImportError("fpdf2 is required for PDF export.")
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(0, 10, f"Analysis Report for {title}", 0, 1, 'C')
+        pdf.ln(10)
+
+        def df_to_pdf_table(pdf, df, title):
+            if df.empty: return
+            pdf.set_font("Arial", 'B', 12)
+            pdf.cell(0, 10, title, 0, 1, 'L')
+            pdf.set_font("Arial", size=10)
+            # Headers
+            col_width = pdf.w / (len(df.columns) + 1.5)
+            pdf.set_fill_color(200, 220, 255)
+            for col in df.columns:
+                pdf.cell(col_width, 10, col, 1, 0, 'C', fill=True)
+            pdf.ln()
+            # Data
+            for index, row in df.iterrows():
+                for item in row:
+                     pdf.cell(col_width, 10, str(round(item, 2) if isinstance(item, float) else item), 1, 0, 'C')
+                pdf.ln()
+            pdf.ln(5)
+
+        df_to_pdf_table(pdf, summary_df, "Summary")
+        df_to_pdf_table(pdf, bpm_df.head(20), "BPM Over Time (First 20 entries)") # Show a sample
+        df_to_pdf_table(pdf, hrv_df, "HRV Metrics")
+        df_to_pdf_table(pdf, inclines_df, "Exertion Periods")
+        df_to_pdf_table(pdf, declines_df, "Recovery Periods")
+
+        pdf.output(path)
+
 
 def main():
     root = ttkb.Window(themename="minty")
