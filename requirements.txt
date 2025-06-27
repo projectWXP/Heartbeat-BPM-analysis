@@ -1,0 +1,16 @@
+# Core Data Science & Plotting Libraries
+numpy
+pandas
+scipy
+plotly
+
+# GUI Library
+ttkbootstrap
+
+# Audio Conversion (Optional but Recommended)
+pydub
+
+# Spreadsheet & PDF Export (Optional but Recommended)
+openpyxl
+odfpy
+fpdf2
