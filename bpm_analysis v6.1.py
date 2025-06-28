@@ -1,6 +1,5 @@
 import os
 import warnings
-import csv
 import numpy as np
 import pandas as pd
 from scipy.io import wavfile
@@ -12,7 +11,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import ttkbootstrap as ttkb
 from ttkbootstrap.constants import *
-from operator import itemgetter
 import datetime
 import logging
 import threading
@@ -35,30 +33,11 @@ except ImportError:
     logging.warning("FFmpeg is also required for audio conversion (add to system PATH).")
     AudioSegment = None
 
-# --- Optional Export Libraries ---
-try:
-    import openpyxl
-except ImportError:
-    logging.warning("openpyxl not found ('pip install openpyxl'). XLSX export will be unavailable.")
-    openpyxl = None
-try:
-    import odf
-    from odf import opendocument, text, table
-except ImportError:
-    logging.warning("odfpy not found ('pip install odfpy'). ODS export will be unavailable.")
-    odf = None
-try:
-    from fpdf import FPDF
-except ImportError:
-    logging.warning("fpdf2 not found ('pip install fpdf2'). PDF export will be unavailable.")
-    FPDF = None
-
-
 # --- Centralized Configuration for Easy Tuning (don't remove the comments)---
 DEFAULT_PARAMS = {
     # Preprocessing Parameters
-    "downsample_factor": 300,      # The factor by which to reduce the audio's sample rate. higher = less detail, faster processing, lower file size
-    "bandpass_freqs": (20, 150),   # (low_hz, high_hz)
+    "downsample_factor": 300,     # The factor by which to reduce the audio's sample rate. higher = less detail, faster processing, lower file size
+    "bandpass_freqs": (20, 150),  # (low_hz, high_hz)
     # =================================================================================
     # Core Beat Detection Parameters
     # These settings govern the main algorithm for finding and classifying peaks.
@@ -111,7 +90,7 @@ DEFAULT_PARAMS = {
     # Increase: Allows the S1-S2 interval to be a larger portion of the cardiac cycle.
     # Decrease: Restricts the S1-S2 interval to be a smaller fraction of the cycle, useful for higher heart rates.
 
-    "pairing_confidence_threshold": 0.55,
+    "pairing_confidence_threshold": 0.52,
     # The confidence score required to classify two adjacent peaks as an S1-S2 pair.
     # Increase: Requires stronger evidence for pairing. Results in fewer S1-S2 pairs and more "Lone S1" beats.
     # Decrease: Easier to form S1-S2 pairs. Risks incorrectly pairing a true S1 with a nearby noise peak.
@@ -132,6 +111,9 @@ DEFAULT_PARAMS = {
     # A peak whose amplitude is N-times the noise floor will bypass the noise-rejection rules and be kept.
     # Increase: Requires a peak to be exceptionally tall to bypass noise rules.
     # Decrease: Allows moderately tall peaks to be kept even if they are in a section considered noisy.
+
+    "penalty_waiver_strength_ratio": 4.0, # S1 peak must be this many times > noise floor to allow a penalty waiver.
+    "penalty_waiver_max_s2_s1_ratio": 2.5, # Even if waived, penalty still applies if S2 is more than N times larger than S1.
 
     # Dynamic HRV-Based Outlier Rejection Parameters
     # =================================================================================
@@ -156,9 +138,18 @@ DEFAULT_PARAMS = {
     # Increase: Allows the BPM belief to make larger jumps, tracking rapid heart rate changes more closely.
     # Decrease: Forces the BPM belief to be smoother, preventing single incorrect detections from skewing the result.
 
+    # =================================================================================
+    # Post-Processing Correction Pass Parameters
+    # These settings control the second analysis pass that uses local context to fix errors.
+    # =================================================================================
+    "enable_correction_pass": True,          # Master switch to enable/disable this feature.
+    "correction_pass_window_beats": 40,      # The size of the moving window (in beats) to calculate the local pairing ratio.
+    "correction_pass_ratio_threshold": 0.70, # If the local pairing ratio is above this, the context is considered "high confidence".
+
+    # --- Other params ---
     "output_smoothing_window_sec": 5,
     "save_filtered_wav": True,
-    "hrv_window_size_beats": 40,   # The size of the sliding window in number of beats.
+    "hrv_window_size_beats": 40,  # The size of the sliding window in number of beats.
     "hrv_step_size_beats": 5      # How many beats the HRV window moves in each step.
 }
 
@@ -304,253 +295,264 @@ def calculate_blended_confidence(deviation, bpm):
     Calculates a confidence score for pairing two peaks based on amplitude deviation.
     This version correctly identifies that S1-S2 pairs have a significant amplitude drop.
     """
-    # An ideal S2 is quieter than S1, creating a high normalized deviation.
-    # We define a "sweet spot" for this deviation.
-    # [X-axis: Deviation values]  0.0 = same amp, 1.0 = one is zero amp
-    # [Y-axis: Confidence values] 0.0 = no confidence, 1.0 = high confidence
-
     deviation_points = [0.0, 0.25, 0.40, 0.80, 1.0]
     confidence_curve = [0.1, 0.40, 0.95, 0.95, 0.1]
-
-    # This interpolation gives high confidence for deviations in the 0.4-0.8 range,
-    # and low confidence for very similar or extremely different amplitudes.
-    # The 'bpm' argument is kept for signature compatibility but is not used in this simplified, more robust model.
     final_confidence = np.interp(deviation, deviation_points, confidence_curve)
-
     return final_confidence
 
+# <--- NEW REFACTORED FUNCTION ---
+def should_veto_by_lookahead(current_peak_idx, next_peak_idx, sorted_troughs, audio_envelope, params):
+    """
+    Checks if a peak should be vetoed by the 'lookahead' rule.
+    Returns True if the peak is vetoed as noise, False otherwise.
+    """
+    trough_search_start_idx = np.searchsorted(sorted_troughs, current_peak_idx, side='right')
+
+    if trough_search_start_idx < len(sorted_troughs):
+        trough_between_idx = sorted_troughs[trough_search_start_idx]
+        if trough_between_idx < next_peak_idx:
+            current_peak_amp = audio_envelope[current_peak_idx]
+            next_peak_amp = audio_envelope[next_peak_idx]
+            trough_amp = audio_envelope[trough_between_idx]
+            veto_multiplier = params['trough_veto_multiplier']
+
+            # If the condition is met, veto the peak
+            if veto_multiplier * (current_peak_amp - trough_amp) < (next_peak_amp - trough_amp):
+                return True
+    return False
+
+# <--- NEW REFACTORED FUNCTION ---
+def calculate_preceding_trough_noise(current_peak_idx, sorted_troughs, dynamic_noise_floor, audio_envelope, params):
+    """
+    Calculates a noise confidence score based on the amplitude of the trough preceding a peak.
+    Returns a high confidence score (e.g., 0.8) if noisy, 0.0 otherwise.
+    """
+    preceding_trough_search = np.searchsorted(sorted_troughs, current_peak_idx, side='left')
+
+    if preceding_trough_search > 0:
+        preceding_trough_idx = sorted_troughs[preceding_trough_search - 1]
+        preceding_trough_amp = audio_envelope[preceding_trough_idx]
+        noise_floor_at_trough = dynamic_noise_floor.iloc[preceding_trough_idx]
+        trough_noise_multiplier = params['trough_noise_multiplier']
+
+        if preceding_trough_amp > (noise_floor_at_trough * trough_noise_multiplier):
+            return 0.8  # High noise confidence
+    return 0.0 # No noise detected
+
+# <--- NEW REFACTORED FUNCTION ---
+def update_long_term_bpm(new_rr_sec, current_long_term_bpm, params):
+    """
+    Updates the long-term BPM belief based on a new R-R interval.
+    Returns the updated BPM value.
+    """
+    instant_bpm = 60.0 / new_rr_sec
+    lr = params['long_term_bpm_learning_rate']
+    max_change_per_beat = params['max_bpm_change_per_beat']
+
+    # Calculate the target BPM using an exponential moving average
+    target_bpm = ((1 - lr) * current_long_term_bpm) + (lr * instant_bpm)
+
+    # Limit how much the BPM can change in a single beat (a "speed limiter")
+    max_change = max_change_per_beat * new_rr_sec # Scale limit by interval duration
+    proposed_change = target_bpm - current_long_term_bpm
+    limited_change = np.clip(proposed_change, -max_change, max_change)
+
+    # Apply the limited change and enforce absolute min/max BPM boundaries
+    new_bpm = current_long_term_bpm + limited_change
+    return max(params['min_bpm'], min(new_bpm, params['max_bpm']))
+
+
+def evaluate_pairing_confidence(s1_idx, s2_idx, smoothed_deviation, audio_envelope, dynamic_noise_floor, params):
+    """
+    Evaluates the confidence of an S1-S2 pair, applying boosts and penalties.
+    Returns: confidence score, a reason string, and a flag indicating if a penalty was applied.
+    """
+    s1_amp = audio_envelope[s1_idx]
+    s2_amp = audio_envelope[s2_idx]
+    reason = ""
+    penalty_applied = False
+
+    confidence = calculate_blended_confidence(smoothed_deviation, 0) # bpm arg is unused
+    reason += f"| Base Pairing Conf: {confidence:.2f} "
+
+    rejection_factor = params.get('s2_amplitude_rejection_factor', 1.5)
+    if s2_amp > (s1_amp * rejection_factor):
+        s1_strength_ratio = s1_amp / (dynamic_noise_floor.iloc[s1_idx] + 1e-9)
+        waiver_strength_threshold = params.get("penalty_waiver_strength_ratio", 4.0)
+        ideal_deviation_range = (0.35, 0.85)
+
+        is_deviation_ideal = ideal_deviation_range[0] <= smoothed_deviation <= ideal_deviation_range[1]
+        is_s1_strong_enough = s1_strength_ratio >= waiver_strength_threshold
+
+        waiver_max_ratio = params.get("penalty_waiver_max_s2_s1_ratio", 2.5)
+        is_ratio_reasonable = (s2_amp / (s1_amp + 1e-9)) < waiver_max_ratio
+
+        if is_deviation_ideal and is_s1_strong_enough and is_ratio_reasonable:
+            reason += f"| Penalty Waived (Ideal Dev {smoothed_deviation:.2f}, Strong S1 {s1_strength_ratio:.1f}x floor, Ratio OK) "
+        else:
+            penalty_factor = 0.5
+            confidence *= penalty_factor
+            penalty_applied = True
+            rejection_note = f"S2 amp {s2_amp:.0f} > {rejection_factor:.1f}x S1 amp {s1_amp:.0f}"
+            if not is_ratio_reasonable:
+                rejection_note += f" & Ratio > {waiver_max_ratio:.1f}"
+            reason += f"| PENALIZED ({rejection_note}) "
+
+    elif s1_amp > (s2_amp * params.get('s1_s2_boost_ratio', 1.2)):
+        confidence_boost = 0.15
+        confidence = min(1.0, confidence + confidence_boost)
+        s1_s2_boost_ratio = params.get('s1_s2_boost_ratio', 1.2)
+        reason += f"| BOOSTED (S1 amp {s1_amp:.0f} > {s1_s2_boost_ratio:.1f}x S2 amp {s2_amp:.0f}) "
+
+    return confidence, reason, penalty_applied
+
+def is_rhythmically_plausible(new_s1_idx, last_s1_idx, long_term_bpm, sample_rate, params):
+    """
+    Checks if a new S1 peak has a plausible R-R interval compared to the last beat.
+    Returns: boolean of plausibility and a reason string if not plausible.
+    """
+    rr_interval_sec = (new_s1_idx - last_s1_idx) / sample_rate
+    if rr_interval_sec <= 0:
+        return False, "Negative/Zero RR Interval"
+
+    expected_rr_sec = 60.0 / long_term_bpm
+    min_plausible_rr = expected_rr_sec * (1 - params['rr_interval_max_decrease_pct'])
+    max_plausible_rr = expected_rr_sec * (1 + params['rr_interval_max_increase_pct'])
+
+    if not (min_plausible_rr <= rr_interval_sec <= max_plausible_rr):
+        instant_bpm = 60.0 / rr_interval_sec
+        reason = (f"RR interval from {last_s1_idx} to {new_s1_idx} ({rr_interval_sec:.3f}s) "
+                  f"is outside plausible range [{min_plausible_rr:.3f}s - {max_plausible_rr:.3f}s] "
+                  f"based on current BPM of {long_term_bpm:.1f}. "
+                  f"Implies instant BPM of {instant_bpm:.0f}.")
+        return False, reason
+
+    return True, ""
+
+
+# <--- REWRITTEN FUNCTION ---
 def find_heartbeat_peaks(audio_envelope, sample_rate, params, start_bpm_hint=None, precomputed_noise_floor=None, precomputed_troughs=None):
-    """ Main logic to classify raw peaks into S1, S2, and Noise."""
+    """ Main logic to classify raw peaks into S1, S2, and Noise by calling helper functions."""
     analysis_data = {}
 
     # Step 1: Calculate or use pre-calculated dynamic noise floor
     if precomputed_noise_floor is not None and precomputed_troughs is not None:
-        logging.info("Using pre-computed noise floor and troughs for this pass.")
-        dynamic_noise_floor = precomputed_noise_floor
-        trough_indices = precomputed_troughs
+        dynamic_noise_floor, trough_indices = precomputed_noise_floor, precomputed_troughs
     else:
-        logging.info("No pre-computed floor found. Calculating noise floor for this pass.")
         dynamic_noise_floor, trough_indices = _calculate_dynamic_noise_floor(audio_envelope, sample_rate, params)
 
     analysis_data['dynamic_noise_floor_series'] = dynamic_noise_floor
     analysis_data['trough_indices'] = trough_indices
 
-    # Step 2: Find all raw peaks above the noise floor
+    # Step 2: Find all raw peaks
     all_peaks = _find_raw_peaks(audio_envelope, dynamic_noise_floor.values, params, sample_rate)
-
     if len(all_peaks) < 2:
-        analysis_data.update({"beat_debug_info": {}, "deviation_times": np.array([]), "deviation_series": np.array([]), "long_term_bpm_series": pd.Series(dtype=np.float64)})
-        return all_peaks, all_peaks, analysis_data
+        return all_peaks, all_peaks, {"beat_debug_info": {}} # Simplified return for empty case
 
-    # Step 3: Calculate amplitude deviations between peaks to help classification
+    # Step 3: Pre-calculate deviations
     peak_amplitudes = audio_envelope[all_peaks]
     normalized_deviations = np.abs(np.diff(peak_amplitudes)) / (np.maximum(peak_amplitudes[:-1], peak_amplitudes[1:]) + 1e-9)
-    deviation_times = (all_peaks[:-1] + all_peaks[1:]) / 2 / sample_rate
     smoothing_window_peaks = max(5, int(len(normalized_deviations) * params['deviation_smoothing_factor']))
     smoothed_dev_series = pd.Series(normalized_deviations).rolling(window=smoothing_window_peaks, min_periods=1, center=True).mean().values
-
-    analysis_data["deviation_times"] = deviation_times
+    analysis_data["deviation_times"] = (all_peaks[:-1] + all_peaks[1:]) / 2 / sample_rate
     analysis_data["deviation_series"] = smoothed_dev_series
 
     # Step 4: Stateful classification loop
     long_term_bpm = float(start_bpm_hint) if start_bpm_hint else 80.0
-    logging.info(f"Initializing Long-Term BPM to: {long_term_bpm:.1f} BPM")
-
     candidate_beats, beat_debug_info, long_term_bpm_history = [], {}, []
     sorted_troughs = sorted(trough_indices)
-
     i = 0
     while i < len(all_peaks):
         current_peak_idx = all_peaks[i]
         reason = ""
 
-        # --- Trough-based Lookahead Veto ---
-        if i < len(all_peaks) - 1:
-            next_peak_idx = all_peaks[i+1]
-            trough_search_start_idx = np.searchsorted(sorted_troughs, current_peak_idx, side='right')
-            if trough_search_start_idx < len(sorted_troughs):
-                trough_between_idx = sorted_troughs[trough_search_start_idx]
-                if trough_between_idx < next_peak_idx:
-                    current_peak_amp, next_peak_amp, trough_amp = audio_envelope[current_peak_idx], audio_envelope[next_peak_idx], audio_envelope[trough_between_idx]
+        # --- A. Initial checks for noise before attempting to pair ---
+        is_potential_s2 = candidate_beats and (current_peak_idx - candidate_beats[-1]) / sample_rate <= min(params['s1_s2_interval_cap_sec'], (60.0/long_term_bpm) * params['s1_s2_interval_rr_fraction'])
 
-                    veto_multiplier = params['trough_veto_multiplier']
-                    lhs = veto_multiplier * (current_peak_amp - trough_amp)
-                    rhs = next_peak_amp - trough_amp
+        # Call helper for lookahead veto
+        if i < len(all_peaks) - 1 and not is_potential_s2:
+            if should_veto_by_lookahead(current_peak_idx, all_peaks[i+1], sorted_troughs, audio_envelope, params):
+                beat_debug_info[current_peak_idx] = "Noise (Vetoed by Lookahead)"
+                i += 1
+                continue
 
-                    if lhs < rhs:
-                        reason = (f"Noise (Vetoed by Lookahead). Condition: {lhs:.1f} < {rhs:.1f}")
-                        beat_debug_info[current_peak_idx] = reason
-                        i += 1
-                        continue
-
-        # --- S2 Logic ---
-        expected_rr = 60.0 / long_term_bpm
-        s1_s2_max_interval = min(params['s1_s2_interval_cap_sec'], expected_rr * params['s1_s2_interval_rr_fraction'])
-        is_potential_s2 = False
-        if candidate_beats and (current_peak_idx - candidate_beats[-1]) / sample_rate <= s1_s2_max_interval:
-            is_potential_s2 = True
-
-        # --- Noise Confidence & Strong Peak Exception ---
-        noise_confidence = 0.0
-        preceding_trough_search = np.searchsorted(sorted_troughs, current_peak_idx, side='left')
-        if preceding_trough_search > 0:
-            preceding_trough_idx = sorted_troughs[preceding_trough_search - 1]
-            preceding_trough_amp = audio_envelope[preceding_trough_idx]
-            noise_floor_at_trough = dynamic_noise_floor.iloc[preceding_trough_idx]
-            if preceding_trough_amp > noise_floor_at_trough * params['trough_noise_multiplier']:
-                noise_confidence = 0.8
-                reason += f"| Noise Conf: High (Trough is {preceding_trough_amp/noise_floor_at_trough:.1f}x floor) "
+        # Call helper for preceding trough noise
+        noise_confidence = calculate_preceding_trough_noise(current_peak_idx, sorted_troughs, dynamic_noise_floor, audio_envelope, params)
+        if noise_confidence > 0:
+            reason += "| Noise Conf: High "
 
         peak_to_floor_ratio = audio_envelope[current_peak_idx] / (dynamic_noise_floor.iloc[current_peak_idx] + 1e-9)
         strong_peak_override = peak_to_floor_ratio >= params['strong_peak_override_ratio']
 
         if noise_confidence > params['noise_confidence_threshold'] and not is_potential_s2 and not strong_peak_override:
-            beat_debug_info[current_peak_idx] = f"Noise (High local noise confidence). {reason.lstrip(' |')}"
+            beat_debug_info[current_peak_idx] = f"Noise (High local noise confidence)"
             i += 1
             continue
-        elif noise_confidence > params['noise_confidence_threshold']:
-            reason += "| Bypassed Noise Rule "
-            if is_potential_s2: reason += "(Potential S2) "
-            if strong_peak_override: reason += f"(Strong Peak: {peak_to_floor_ratio:.1f}x floor)"
 
-        # --- Main Pairing Logic ---
-        # This section iterates through peaks, decides if they form S1-S2 pairs or are lone S1 beats, and rejects outliers.
-        if i >= len(all_peaks) - 1: # Last peak is always a lone S1
+        # --- B. Main Pairing or Lone S1 Logic ---
+        if i >= len(all_peaks) - 1: # Last peak must be a Lone S1
             candidate_beats.append(current_peak_idx)
             beat_debug_info[current_peak_idx] = "Lone S1 (Last Peak)"
             i += 1
-            # The loop will terminate, but the BPM update below will run one last time.
-        else:
+        else: # Attempt to pair with the next peak
             next_peak_idx = all_peaks[i + 1]
             interval_sec = (next_peak_idx - current_peak_idx) / sample_rate
-            smoothed_deviation = smoothed_dev_series[i]
 
-            pairing_confidence = calculate_blended_confidence(smoothed_deviation, long_term_bpm)
-            reason += f"| Base Pairing Conf: {pairing_confidence:.2f} "
-
-            # Heuristic: Boost pairing confidence if NOT pairing would cause a massive, unlikely BPM spike
-            if params.get("enable_bpm_boost", True):
-                bpm_if_not_paired = 60.0 / interval_sec if interval_sec > 0 else 999
-                if bpm_if_not_paired > long_term_bpm * 1.7 and long_term_bpm < 150:
-                    pairing_confidence = min(0.95, pairing_confidence + 0.3)
-                    reason += f"| BOOSTED (Prevented {bpm_if_not_paired:.0f} BPM spike) "
-
-            is_paired = interval_sec <= s1_s2_max_interval and pairing_confidence > params['pairing_confidence_threshold']
-            if is_paired:
-                s1_amp = audio_envelope[current_peak_idx]
-                s2_amp = audio_envelope[next_peak_idx]
-                rejection_factor = params.get('s2_amplitude_rejection_factor', 1.5)
-
-                # apply a confidence penalty if the S2 candidate is larger than the S1.
-                if s2_amp > (s1_amp * rejection_factor):
-                    penalty_factor = 0.5 # Halve the confidence
-                    pairing_confidence *= penalty_factor
-                    reason += f"| PENALIZED (S2 > {rejection_factor:.1f}x S1) "
-                    # Re-evaluate pairing with the new, lower confidence score
-                    is_paired = interval_sec <= s1_s2_max_interval and pairing_confidence > params['pairing_confidence_threshold']
+            # Call helper to get pairing confidence
+            pairing_confidence, pair_reason, penalty_applied = evaluate_pairing_confidence(
+                current_peak_idx, next_peak_idx, smoothed_dev_series[i], audio_envelope, dynamic_noise_floor, params
+            )
+            reason += pair_reason
+            is_paired = interval_sec <= min(params['s1_s2_interval_cap_sec'], (60.0/long_term_bpm) * params['s1_s2_interval_rr_fraction']) and pairing_confidence >= params['pairing_confidence_threshold']
 
             if is_paired:
-                s1_idx = current_peak_idx
-                candidate_beats.append(s1_idx)
-                beat_debug_info[s1_idx] = f"S1 (Paired). {reason.lstrip(' |')}"
+                candidate_beats.append(current_peak_idx)
+                beat_debug_info[current_peak_idx] = f"S1 (Paired). {reason.lstrip(' |')}"
                 beat_debug_info[next_peak_idx] = f"S2 (Paired). Justification: {reason.lstrip(' |')}"
-                i += 2  # Skip S2 in the next iteration
-            else:  # Not paired, treat as a potential lone S1.
-                s1_idx = current_peak_idx
-
-                # --- BPM Outlier Rejection Logic ---
-                if s1_idx in beat_debug_info: # If the S1 was already marked as noise by the new rule
+                i += 2
+            else: # Not a pair, evaluate as Lone S1 or Noise
+                if penalty_applied and not strong_peak_override:
+                    beat_debug_info[current_peak_idx] = f"Noise (Rejected: Inverted S1/S2). {reason.lstrip(' |')}"
+                    i += 1
+                    continue
+                if is_potential_s2:
+                    beat_debug_info[current_peak_idx] = f"Noise (Rejected Failed S2 Candidate). {reason.lstrip(' |')}"
                     i += 1
                     continue
 
+                # Call helper to check if rhythmically plausible
                 if candidate_beats:
-                    previous_beat_idx = candidate_beats[-1]
-                    rr_interval_sec = (s1_idx - previous_beat_idx) / sample_rate
-                    if rr_interval_sec > 0.0:
-                        # Get the expected RR interval based on the algorithm's current belief
-                        expected_rr_sec = 60.0 / long_term_bpm
+                    plausible, rhytm_reason = is_rhythmically_plausible(current_peak_idx, candidate_beats[-1], long_term_bpm, sample_rate, params)
+                    if not plausible:
+                        beat_debug_info[current_peak_idx] = f"Noise (Rejected: {rhytm_reason})"
+                        i += 1
+                        continue
 
-                        # Define the plausible range for the new RR interval
-                        min_plausible_rr = expected_rr_sec * (1 - params['rr_interval_max_decrease_pct'])
-                        max_plausible_rr = expected_rr_sec * (1 + params['rr_interval_max_increase_pct'])
-
-                        # Check if the new interval is outside the plausible window
-                        if not (min_plausible_rr <= rr_interval_sec <= max_plausible_rr):
-                            # --- Double check rejection ---
-                            corrected = False
-                            if i > 0: # Ensure we don't look back past the beginning of the array
-                                previous_raw_peak_idx = all_peaks[i - 1]
-                                previous_raw_peak_reason = beat_debug_info.get(previous_raw_peak_idx, '')
-
-                                # Check if the previous raw peak was classified as noise
-                                if "Noise" in previous_raw_peak_reason:
-                                    logging.info(f"Applying specific correction at {s1_idx/sample_rate:.2f}s. "
-                                                 f"Overriding previous noise peak at {previous_raw_peak_idx/sample_rate:.2f}s.")
-
-                                    # Force-add the previously-rejected noise peak as a valid S1
-                                    candidate_beats.append(previous_raw_peak_idx)
-                                    beat_debug_info[previous_raw_peak_idx] = "Lone S1 (Corrected by RR-based rule)"
-
-                                    # Re-evaluate the current peak against the newly corrected history.
-                                    # `previous_beat_idx` is now the peak we just force-added.
-                                    previous_beat_idx = candidate_beats[-1]
-                                    rr_interval_sec = (s1_idx - previous_beat_idx) / sample_rate
-
-                                    # If the new interval is now valid, set a flag to prevent the
-                                    # original rejection logic from running.
-                                    if (min_plausible_rr <= rr_interval_sec <= max_plausible_rr):
-                                        corrected = True
-
-                            # If the correction logic wasn't triggered or didn't fix the timing,
-                            # then proceed with the original rejection.
-                            if not corrected:
-                                instant_bpm = 60.0 / rr_interval_sec
-                                rejection_reason = (f"Noise (Rejected: RR interval {rr_interval_sec:.3f}s "
-                                                    f"is outside plausible range [{min_plausible_rr:.3f}s - {max_plausible_rr:.3f}s] "
-                                                    f"based on current BPM of {long_term_bpm:.1f}). "
-                                                    f"Implies instant BPM of {instant_bpm:.0f}.")
-                                beat_debug_info[s1_idx] = rejection_reason
-                                i += 1
-                                continue # Reject this peak and move to the next
-
-                # If the check above passed (or was corrected), proceed to add the peak as a Lone S1.
-                candidate_beats.append(s1_idx)
-                beat_debug_info[s1_idx] = f"Lone S1. {reason.lstrip(' |')}"
+                candidate_beats.append(current_peak_idx)
+                beat_debug_info[current_peak_idx] = f"Lone S1. {reason.lstrip(' |')}"
                 i += 1
 
-        # --- Long-Term BPM Belief Update ---
+        # --- C. Update Long-Term BPM Belief ---
         if len(candidate_beats) > 1:
-            # The new S1 beat is the last one added.
-            new_s1_idx = candidate_beats[-1]
-            # The previous S1 beat is the second to last.
-            previous_s1_idx = candidate_beats[-2]
-
-            new_rr = (new_s1_idx - previous_s1_idx) / sample_rate
+            new_rr = (candidate_beats[-1] - candidate_beats[-2]) / sample_rate
             if new_rr > 0:
-                instant_bpm = 60.0 / new_rr
-                # Apply learning rate
-                lr = params['long_term_bpm_learning_rate']
-                target_bpm = ((1 - lr) * long_term_bpm) + (lr * instant_bpm)
-                # Limit rate of change
-                max_change = params['max_bpm_change_per_beat'] * new_rr
-                proposed_change = target_bpm - long_term_bpm
-                limited_change = np.clip(proposed_change, -max_change, max_change)
-                long_term_bpm = max(params['min_bpm'], min(long_term_bpm + limited_change, params['max_bpm']))
+                # Call helper to update BPM
+                long_term_bpm = update_long_term_bpm(new_rr, long_term_bpm, params)
 
-        # Add the current state of the long-term BPM to the history for plotting.
         if candidate_beats:
             long_term_bpm_history.append((candidate_beats[-1] / sample_rate, long_term_bpm))
 
+    # --- D. Finalize and return results ---
     final_peaks = np.array(sorted(list(dict.fromkeys(candidate_beats))))
-    logging.info(f"Final peak count after stateful grouping: {len(final_peaks)}.")
-
     analysis_data["beat_debug_info"] = beat_debug_info
     if long_term_bpm_history:
         lt_bpm_times, lt_bpm_values = zip(*long_term_bpm_history)
         analysis_data["long_term_bpm_series"] = pd.Series(lt_bpm_values, index=lt_bpm_times)
     else:
         analysis_data["long_term_bpm_series"] = pd.Series(dtype=np.float64)
+
     return final_peaks, all_peaks, analysis_data
+
 
 def correct_peaks_by_rhythm(peaks, audio_envelope, sample_rate, params):
     """
@@ -602,6 +604,68 @@ def correct_peaks_by_rhythm(peaks, audio_envelope, sample_rate, params):
     else:
         logging.info("Correction pass complete. No rhythmic conflicts found.")
     return np.array(corrected_peaks)
+
+def correct_beats_with_local_context(s1_peaks, all_raw_peaks, beat_debug_info, params):
+    """
+    Performs a second analysis pass to correct misclassified beats using local rhythm context.
+
+    This function identifies 'Lone S1' beats that are likely part of a missed pair
+    by analyzing the pairing success rate in their local neighborhood.
+    """
+    if not params.get("enable_correction_pass", False) or len(s1_peaks) < params["correction_pass_window_beats"]:
+        logging.info("Correction pass skipped (disabled or not enough beats).")
+        return s1_peaks, beat_debug_info, 0
+
+    logging.info("--- STAGE 5: Running Correction Pass with Local Rhythm Context ---")
+
+    pairing_success = [1 if "S1 (Paired)" in beat_debug_info.get(peak_idx, "") else 0 for peak_idx in s1_peaks]
+    pairing_series = pd.Series(pairing_success, name="pairing_ratio")
+    window_size = params["correction_pass_window_beats"]
+    local_pairing_ratio = pairing_series.rolling(window=window_size, min_periods=max(1, window_size // 2)).mean().bfill().ffill()
+
+    if local_pairing_ratio.empty:
+        logging.warning("Could not calculate local pairing ratio. Skipping correction.")
+        return s1_peaks, beat_debug_info, 0
+
+    corrected_debug_info = beat_debug_info.copy()
+    raw_peaks_list = all_raw_peaks.tolist()
+    corrections_made = 0
+    s1_peak_to_position = {peak: i for i, peak in enumerate(s1_peaks)}
+
+    for s1_peak_idx in s1_peaks:
+        if beat_debug_info.get(s1_peak_idx, "").startswith("Lone S1"):
+            try:
+                current_raw_idx = raw_peaks_list.index(s1_peak_idx)
+                if current_raw_idx + 1 < len(raw_peaks_list):
+                    next_raw_peak = raw_peaks_list[current_raw_idx + 1]
+                else:
+                    continue
+            except ValueError:
+                continue
+
+            if beat_debug_info.get(next_raw_peak, "").startswith("Noise (Rejected Failed S2 Candidate)"):
+                s1_position = s1_peak_to_position.get(s1_peak_idx)
+                if s1_position is None: continue
+
+                current_local_ratio = local_pairing_ratio.iloc[s1_position]
+
+                if current_local_ratio >= params["correction_pass_ratio_threshold"]:
+                    corrections_made += 1
+
+                    original_reason = corrected_debug_info[s1_peak_idx]
+                    corrected_debug_info[s1_peak_idx] = f"S1 (Paired - Corrected). Original: [{original_reason}]"
+
+                    original_noise_reason = corrected_debug_info[next_raw_peak]
+                    corrected_debug_info[next_raw_peak] = f"S2 (Paired - Corrected). Justification: High local pairing ratio ({current_local_ratio:.2f}). Original: [{original_noise_reason}]"
+
+    logging.info(f"Correction pass complete. Relabeled {corrections_made} S1/S2 pairs.")
+
+    final_s1_peaks = np.array(sorted([
+        peak for peak, reason in corrected_debug_info.items()
+        if reason.startswith("S1 (Paired") or reason.startswith("Lone S1")
+    ]))
+
+    return final_s1_peaks, corrected_debug_info, corrections_made
 
 def calculate_windowed_hrv(s1_peaks, sample_rate, params):
     """ Calculates HRV metrics using R-R intervals based on changing heart rate """
@@ -751,11 +815,11 @@ def plot_results(audio_envelope, peaks, all_raw_peaks, analysis_data, smoothed_b
         fig.add_trace(go.Scatter(x=noise_times_dt, y=audio_envelope[noise_indices], mode='markers', name='Noise/Rejected Peaks', marker=dict(color='grey', symbol='x', size=6), customdata=noise_customdata, hovertemplate=peak_hovertemplate), secondary_y=False)
 
     if not smoothed_bpm.empty:
-        fig.add_trace(go.Scatter(x=smoothed_bpm.index, y=smoothed_bpm.values, name="Smoothed BPM", line=dict(color="#4a4a4a", width=3, dash='solid')), secondary_y=True)
+        fig.add_trace(go.Scatter(x=smoothed_bpm.index, y=smoothed_bpm.values, name="Average BPM", line=dict(color="#4a4a4a", width=3, dash='solid')), secondary_y=True)
     if "long_term_bpm_series" in analysis_data and not analysis_data["long_term_bpm_series"].empty:
         lt_series = analysis_data["long_term_bpm_series"]
         lt_times_dt = pd.to_datetime([start_datetime + datetime.timedelta(seconds=t) for t in lt_series.index])
-        fig.add_trace(go.Scatter(x=lt_times_dt, y=lt_series.values, name="Long-Term BPM", line=dict(color='orange', width=2, dash='dot')), secondary_y=True)
+        fig.add_trace(go.Scatter(x=lt_times_dt, y=lt_series.values, name="BPM Trend (Belief)", line=dict(color='orange', width=2, dash='dot'), visible='legendonly'), secondary_y=True)
     if windowed_hrv_df is not None and not windowed_hrv_df.empty:
         hrv_times_dt = pd.to_datetime([start_datetime + datetime.timedelta(seconds=t) for t in windowed_hrv_df['time']])
         fig.add_trace(go.Scatter(x=hrv_times_dt, y=windowed_hrv_df['rmssdc'], name="RMSSD", line=dict(color='cyan', width=2), visible='legendonly'), secondary_y=True)
@@ -985,7 +1049,7 @@ def save_analysis_summary(output_path, file_name, hrv_summary, hrr_stats, peak_e
 
         # --- Heartbeat Data Table ---
         f.write("## Heartbeat Data (BPM over Time)\n\n")
-        f.write("| Time (s) | Smoothed BPM |\n")
+        f.write("| Time (s) | Average BPM |\n")
         f.write("|:---:|:---:|\n")
         if not smoothed_bpm.empty:
             for t, bpm in zip(bpm_times, smoothed_bpm.values):
@@ -1081,7 +1145,7 @@ def create_chronological_log_file(audio_envelope, sample_rate, all_raw_peaks, an
                 if 'amp' in row and not pd.isna(row['amp']): log_file.write(f"**Raw Peak** (Amp: {row['amp']:.2f})\n")
 
                 if 'S1' in reason:
-                    if 'smoothed_bpm' in row and not pd.isna(row['smoothed_bpm']): log_file.write(f"**Smoothed BPM**: {row['smoothed_bpm']:.2f}\n")
+                    if 'smoothed_bpm' in row and not pd.isna(row['smoothed_bpm']): log_file.write(f"**Average BPM (Smoothed)**: {row['smoothed_bpm']:.2f}\n")
                     if 'lt_bpm' in row and not pd.isna(row['lt_bpm']): log_file.write(f"**Long-Term BPM (Belief)**: {row['lt_bpm']:.2f}\n")
                     if 'deviation' in row and not pd.isna(row['deviation']): log_file.write(f"**Norm. Deviation**: {row['deviation'] * 100:.2f}%\n")
 
@@ -1426,7 +1490,7 @@ def analyze_wav_file(wav_file_path, params, start_bpm_hint): # We keep the signa
     # --- STAGE 3: PRIMARY ANALYSIS PASS ---
     logging.info("--- STAGE 3: Running Main Analysis Pass with refined inputs ---")
 
-    peaks, all_raw_peaks, analysis_data = find_heartbeat_peaks(
+    s1_peaks_pass1, all_raw_peaks, analysis_data = find_heartbeat_peaks(
         audio_envelope,
         sample_rate,
         params,
@@ -1436,14 +1500,50 @@ def analyze_wav_file(wav_file_path, params, start_bpm_hint): # We keep the signa
     )
 
     # --- STAGE 4: POST-CORRECTION PASS (PEAK VALIDATION) ---
-    final_peaks = correct_peaks_by_rhythm(peaks, audio_envelope, sample_rate, params)
+    # This stage corrects for rhythm based on amplitude conflicts.
+    s1_peaks_pass2 = correct_peaks_by_rhythm(s1_peaks_pass1, audio_envelope, sample_rate, params)
+
+    # ========================== NEW ITERATIVE STAGE ==========================
+    # --- STAGE 5: CONTEXTUAL CORRECTION PASS (Iterative) ---
+    # This loop will continue until a full pass makes zero new corrections,
+    # ensuring the local pairing ratio is always based on the latest data.
+
+    final_peaks = s1_peaks_pass2
+    corrected_debug_info = analysis_data["beat_debug_info"].copy()
+    max_iterations = 5 # A safeguard against potential infinite loops
+
+    for i in range(max_iterations):
+
+        new_peaks, new_debug_info, corrections_made = correct_beats_with_local_context(
+            s1_peaks=final_peaks,
+            all_raw_peaks=all_raw_peaks,
+            beat_debug_info=corrected_debug_info,
+            params=params
+        )
+
+        # Update the state for the next potential iteration
+        final_peaks = new_peaks
+        corrected_debug_info = new_debug_info
+
+        logging.info(f"Correction Pass Iteration {i + 1} made {corrections_made} changes.")
+
+        # If a pass makes no changes, the process is stable and we can exit.
+        if corrections_made == 0:
+            logging.info("Correction process stabilized. Exiting loop.")
+            break
+    else: # This 'else' belongs to the 'for' loop, runs if it completes without a break
+        logging.warning("Correction process reached max iterations without stabilizing.")
+
+    # Update the main analysis_data with the final corrected debug info for the plot
+    analysis_data["beat_debug_info"] = corrected_debug_info
+    # =======================================================================
 
     # --- FINAL CALCULATIONS AND OUTPUT ---
-    analysis_output = { "file_name": wav_file_path }
+    # Note: We now use 'final_peaks' from the correction pass for all subsequent calculations.
     if len(final_peaks) < 2:
         logging.warning("Not enough S1 peaks detected after correction to calculate BPM.")
         plot_results(audio_envelope, final_peaks, all_raw_peaks, analysis_data, pd.Series(dtype=np.float64), np.array([]), sample_rate, wav_file_path, params)
-        return analysis_output # Return partial results
+        return
 
     smoothed_bpm, bpm_times = calculate_bpm_series(final_peaks, sample_rate, params)
 
@@ -1487,30 +1587,15 @@ def analyze_wav_file(wav_file_path, params, start_bpm_hint): # We keep the signa
     output_log_path = f"{file_name_no_ext}_Debug_Log.md"
     create_chronological_log_file(audio_envelope, sample_rate, all_raw_peaks, analysis_data, smoothed_bpm, output_log_path, wav_file_path)
 
-    # --- Bundle all results for return ---
-    analysis_output.update({
-        "hrv_summary": hrv_summary_stats,
-        "hrr_stats": hrr_stats,
-        "peak_exertion_stats": peak_exertion_stats,
-        "peak_recovery_stats": peak_recovery_stats,
-        "major_inclines": major_inclines,
-        "major_declines": major_declines,
-        "smoothed_bpm": smoothed_bpm,
-        "bpm_times": bpm_times,
-        "windowed_hrv_df": windowed_hrv_df
-    })
-    return analysis_output
-
 
 # --- GUI Class ---
 class BPMApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Heartbeat BPM Analyzer")
-        self.root.geometry("600x380")
+        self.root.geometry("550x350")
         self.style = ttkb.Style(theme='minty')
         self.current_file = None
-        self.analysis_results = None # To store results for export
         self.params = DEFAULT_PARAMS.copy()
         self.log_queue = queue.Queue()
         self.create_widgets()
@@ -1524,7 +1609,7 @@ class BPMApp:
         # File selection
         file_frame = ttk.LabelFrame(main_frame, text="Audio File", padding=10)
         file_frame.pack(fill=tk.X, pady=5)
-        self.file_label = ttk.Label(file_frame, text="No file selected", wraplength=500)
+        self.file_label = ttk.Label(file_frame, text="No file selected", wraplength=450)
         self.file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         browse_btn = ttk.Button(file_frame, text="Browse", command=self.select_file, bootstyle=INFO)
         browse_btn.pack(side=tk.RIGHT, padx=5)
@@ -1539,11 +1624,8 @@ class BPMApp:
         # Action Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=20)
-        self.export_btn = ttk.Button(btn_frame, text="Export Results", command=self.export_data, bootstyle=SECONDARY, state=tk.DISABLED)
-        self.export_btn.pack(side=tk.LEFT, padx=5)
         self.analyze_btn = ttk.Button(btn_frame, text="Analyze", command=self.start_analysis_thread, bootstyle=SUCCESS, state=tk.DISABLED)
         self.analyze_btn.pack(side=tk.RIGHT, padx=5)
-
 
         # Status Bar
         self.status_var = tk.StringVar(value="Select an audio file to begin.")
@@ -1560,14 +1642,12 @@ class BPMApp:
                 if message_type == "status":
                     self.status_var.set(data)
                 elif message_type == "analysis_complete":
-                    self.status_var.set("Analysis complete! Reports saved. Ready to export.")
+                    self.status_var.set("Analysis complete!")
                     self.analyze_btn.config(state=tk.NORMAL)
-                    self.export_btn.config(state=tk.NORMAL) # Enable export button
                 elif message_type == "error":
-                    self.status_var.set("An error occurred. Check logs.")
-                    self.analyze_btn.config(state=tk.NORMAL)
-                    self.export_btn.config(state=tk.DISABLED) # Keep it disabled on error
-                    messagebox.showerror("Analysis Error", data)
+                     self.status_var.set("An error occurred. Check logs.")
+                     self.analyze_btn.config(state=tk.NORMAL)
+                     messagebox.showerror("Analysis Error", data)
 
         finally:
             self.root.after(100, self.process_log_queue)
@@ -1579,7 +1659,6 @@ class BPMApp:
             self.current_file = filename
             self.file_label.config(text=os.path.basename(filename))
             self.analyze_btn.config(state=tk.NORMAL)
-            self.export_btn.config(state=tk.DISABLED) # Disable on new file selection
             self._update_status(f"Ready to analyze: {os.path.basename(filename)}")
 
     def _find_initial_audio_file(self):
@@ -1606,8 +1685,6 @@ class BPMApp:
             return
 
         self.analyze_btn.config(state=tk.DISABLED)
-        self.export_btn.config(state=tk.DISABLED)
-        self.analysis_results = None # Clear previous results
         self._update_status("Starting analysis...")
 
         analysis_thread = threading.Thread(target=self._run_analysis_in_background)
@@ -1634,165 +1711,13 @@ class BPMApp:
                 shutil.copy(self.current_file, wav_path)
 
             self.log_queue.put(("status", "Processing and analyzing heartbeat..."))
-            self.analysis_results = analyze_wav_file(wav_path, self.params, start_bpm_hint)
+            analyze_wav_file(wav_path, self.params, start_bpm_hint)
             self.log_queue.put(("analysis_complete", None))
 
         except Exception as e:
             error_info = f"An error occurred:\n{str(e)}"
             self.log_queue.put(("error", error_info))
             logging.error(f"Full analysis error: {traceback.format_exc()}")
-
-    def export_data(self):
-        """Handles the logic for exporting data to a selected file format."""
-        if not self.analysis_results:
-            messagebox.showinfo("Export Notice", "Please run an analysis before exporting.")
-            return
-
-        file_types_list = []
-        if openpyxl: file_types_list.append(('Excel Spreadsheet', '*.xlsx'))
-        if odf: file_types_list.append(('OpenDocument Spreadsheet', '*.ods'))
-        if FPDF: file_types_list.append(('PDF Document', '*.pdf'))
-        file_types_list.extend([
-            ('HTML File', '*.html'),
-            ('Comma-Separated Values', '*.csv'),
-            ('Tab-Separated Values', '*.tsv')
-        ])
-
-        file_name_base = os.path.splitext(os.path.basename(self.analysis_results.get("file_name", "analysis")))[0]
-
-        output_path = filedialog.asksaveasfilename(
-            title="Export Analysis Results",
-            initialfile=f"{file_name_base}_export",
-            filetypes=file_types_list,
-            defaultextension='.xlsx'
-        )
-
-        if not output_path:
-            return # User cancelled
-
-        self.status_var.set(f"Exporting to {os.path.basename(output_path)}...")
-        self.root.update_idletasks() # Force GUI update
-
-        try:
-            # Prepare dataframes
-            results = self.analysis_results
-            summary_df = self._prepare_summary_df(results)
-            bpm_df = self._prepare_bpm_df(results)
-            hrv_df = results.get('windowed_hrv_df', pd.DataFrame())
-            inclines_df = pd.DataFrame(results.get('major_inclines', []))
-            declines_df = pd.DataFrame(results.get('major_declines', []))
-
-            ext = os.path.splitext(output_path)[1].lower()
-            if ext == '.xlsx' or ext == '.ods':
-                engine = 'openpyxl' if ext == '.xlsx' else 'odf'
-                with pd.ExcelWriter(output_path, engine=engine) as writer:
-                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                    bpm_df.to_excel(writer, sheet_name='BPM_Over_Time', index=False)
-                    if not hrv_df.empty: hrv_df.to_excel(writer, sheet_name='HRV_Metrics', index=False)
-                    if not inclines_df.empty: inclines_df.to_excel(writer, sheet_name='Exertion_Periods', index=False)
-                    if not declines_df.empty: declines_df.to_excel(writer, sheet_name='Recovery_Periods', index=False)
-            elif ext == '.csv' or ext == '.tsv':
-                sep = ',' if ext == '.csv' else '\t'
-                with open(output_path, 'w', encoding='utf-8', newline='') as f:
-                    f.write("# Analysis Summary\n")
-                    f.write(summary_df.to_csv(sep=sep, index=False))
-                    f.write("\n# BPM Over Time\n")
-                    f.write(bpm_df.to_csv(sep=sep, index=False))
-                    if not hrv_df.empty:
-                        f.write("\n# HRV Metrics\n")
-                        f.write(hrv_df.to_csv(sep=sep, index=False))
-            elif ext == '.html':
-                 with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(f"<html><head><title>Analysis for {file_name_base}</title></head><body>")
-                    f.write(f"<h1>Analysis for {file_name_base}</h1>")
-                    f.write("<h2>Summary</h2>" + summary_df.to_html(index=False))
-                    f.write("<h2>BPM Over Time</h2>" + bpm_df.to_html(index=False))
-                    if not hrv_df.empty: f.write("<h2>HRV Metrics</h2>" + hrv_df.to_html(index=False))
-                    if not inclines_df.empty: f.write("<h2>Exertion Periods</h2>" + inclines_df.to_html(index=False))
-                    if not declines_df.empty: f.write("<h2>Recovery Periods</h2>" + declines_df.to_html(index=False))
-                    f.write("</body></html>")
-            elif ext == '.pdf':
-                self._export_to_pdf(output_path, file_name_base, summary_df, bpm_df, hrv_df, inclines_df, declines_df)
-
-            self.status_var.set(f"Successfully exported to {os.path.basename(output_path)}")
-            messagebox.showinfo("Export Successful", f"Data exported to:\n{output_path}")
-        except Exception as e:
-            logging.error(f"Failed to export data: {traceback.format_exc()}")
-            messagebox.showerror("Export Failed", f"Could not export data.\nError: {e}")
-            self.status_var.set("Export failed.")
-
-
-    def _prepare_summary_df(self, results):
-        """Helper to create a nice summary DataFrame from various result dicts."""
-        summary_data = []
-        # General HRV Summary
-        if 'hrv_summary' in results and results['hrv_summary']:
-            for k, v in results['hrv_summary'].items():
-                summary_data.append({'Metric': k, 'Value': f"{v:.2f}"})
-        # HRR Stats
-        if 'hrr_stats' in results and results['hrr_stats']:
-            hrr = results['hrr_stats']
-            summary_data.append({'Metric': '1-Min HRR (BPM Drop)', 'Value': f"{hrr['hrr_value_bpm']:.2f}"})
-            summary_data.append({'Metric': 'Peak BPM for HRR', 'Value': f"{hrr['peak_bpm']:.2f}"})
-        # Peak Exertion
-        if 'peak_exertion_stats' in results and results['peak_exertion_stats']:
-            pes = results['peak_exertion_stats']
-            summary_data.append({'Metric': 'Peak Exertion Rate (BPM/sec)', 'Value': f"{pes['slope_bpm_per_sec']:.2f}"})
-        # Peak Recovery
-        if 'peak_recovery_stats' in results and results['peak_recovery_stats']:
-            prs = results['peak_recovery_stats']
-            summary_data.append({'Metric': 'Peak Recovery Rate (BPM/sec)', 'Value': f"{prs['slope_bpm_per_sec']:.2f}"})
-        return pd.DataFrame(summary_data)
-
-    def _prepare_bpm_df(self, results):
-        """Helper to create the main BPM time series DataFrame."""
-        if 'smoothed_bpm' in results and not results['smoothed_bpm'].empty:
-            df = pd.DataFrame({
-                'Timestamp': results['smoothed_bpm'].index,
-                'Time_sec': results['bpm_times'],
-                'Smoothed_BPM': results['smoothed_bpm'].values
-            })
-            df['Timestamp'] = df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S.%f')
-            return df
-        return pd.DataFrame()
-
-    def _export_to_pdf(self, path, title, summary_df, bpm_df, hrv_df, inclines_df, declines_df):
-        """Helper to generate a PDF report."""
-        if not FPDF:
-            raise ImportError("fpdf2 is required for PDF export.")
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", 'B', 16)
-        pdf.cell(0, 10, f"Analysis Report for {title}", 0, 1, 'C')
-        pdf.ln(10)
-
-        def df_to_pdf_table(pdf, df, title):
-            if df.empty: return
-            pdf.set_font("Arial", 'B', 12)
-            pdf.cell(0, 10, title, 0, 1, 'L')
-            pdf.set_font("Arial", size=10)
-            # Headers
-            col_width = pdf.w / (len(df.columns) + 1.5)
-            pdf.set_fill_color(200, 220, 255)
-            for col in df.columns:
-                pdf.cell(col_width, 10, col, 1, 0, 'C', fill=True)
-            pdf.ln()
-            # Data
-            for index, row in df.iterrows():
-                for item in row:
-                     pdf.cell(col_width, 10, str(round(item, 2) if isinstance(item, float) else item), 1, 0, 'C')
-                pdf.ln()
-            pdf.ln(5)
-
-        df_to_pdf_table(pdf, summary_df, "Summary")
-        df_to_pdf_table(pdf, bpm_df.head(20), "BPM Over Time (First 20 entries)") # Show a sample
-        df_to_pdf_table(pdf, hrv_df, "HRV Metrics")
-        df_to_pdf_table(pdf, inclines_df, "Exertion Periods")
-        df_to_pdf_table(pdf, declines_df, "Recovery Periods")
-
-        pdf.output(path)
-
 
 def main():
     root = ttkb.Window(themename="minty")
